@@ -166,51 +166,7 @@ class ApolloLaneDataset(Dataset):
                              [0., 0., 1.]])
 
         return proj_g2c, camera_K
-    def create_point_cloud_from_rgb_depth(self, imgDep, cx, cy, fx, fy, depth_scale=1.0):
-        """
-        Creates a point cloud from RGB and depth images.
 
-        Args:
-            rgb_path (str): The file path of the RGB image.
-            depth_path (str): The file path of the depth image.
-            cx (float): The X-coordinate center of the camera.
-            cy (float): The Y-coordinate center of the camera.
-            fx (float): The X-axis focal length of the camera.
-            fy (float): The Y-axis focal length of the camera.
-            depth_scale (float, optional): The scaling factor for the depth. Defaults to 1.0.
-
-        Returns:
-            point_cloud (open3d.geometry.PointCloud): The resulting point cloud.
-        """
-        # Load the images
-
-
-        # Check that the input images are NumPy arrays
-        if  not isinstance(imgDep, np.ndarray):
-            raise TypeError("Input images must be NumPy arrays.")
-
-
-
-        # Check that the input images are 3-channel RGB and single-channel depth
-
-        if imgDep.ndim == 3 and imgDep.shape[2] == 3:
-            # imgDep = np.dot(imgDep[..., :3], [0.299, 0.587, 0.114])
-            imgDep=imgDep[...,0]
-
-
-
-        # Calculate the XYZ values for each point
-        rows, cols = imgDep.shape
-        u, v = np.meshgrid(np.arange(cols), np.arange(rows))
-        d = imgDep.astype(np.float32) / depth_scale
-        x = (u - cx) * d / fx
-        y = (v - cy) * d / fy
-        z = d
-
-        # Combine XYZ values into a single array
-        points = np.stack([x, y, z], axis=-1)
-
-        return points
     # new getitem, WIP
     def WIP__getitem__(self, idx):
         """
@@ -233,17 +189,27 @@ class ApolloLaneDataset(Dataset):
         else:
             raise ValueError('check release with training, fix_cam=False')
         img_name = _label_image_path
-        dep_name= img_name.replace('images', 'rsdepth').replace('jpg', 'png')
+        dep_name= img_name.replace('images', 'depth_absolute').replace('jpg', 'png')
         _, file_name = os.path.split(img_name)
 
 
         with open(img_name, 'rb') as f:
             image = (Image.open(f).convert('RGB'))
-        dep_image = cv2.imread(dep_name)
-        image = F.resize(image, size=(self.h_net, self.w_net), interpolation=InterpolationMode.BILINEAR)
+        dep_image = cv2.imread(dep_name, cv2.IMREAD_ANYDEPTH)
         if dep_image is None:
-            print(img_name)
-        dep_image = cv2.resize(dep_image, (self.w_net, self.h_net), interpolation=cv2.INTER_LINEAR)
+            print(f"Error loading depth: {dep_name}")
+            
+        
+        dep_image = cv2.resize(dep_image, (self.w_net, self.h_net), interpolation=cv2.INTER_NEAREST)
+
+       
+        dep_image = dep_image.astype(np.float32)
+        
+       
+        dep_image = torch.from_numpy(dep_image)  
+        dep_image = dep_image.unsqueeze(0)       
+        dep_image = dep_image / 1000.0   
+        image = F.resize(image, size=(self.h_net, self.w_net), interpolation=InterpolationMode.BILINEAR)
         gt_category_2d = _gt_laneline_category_org
 
 
@@ -336,15 +302,6 @@ class ApolloLaneDataset(Dataset):
 
         seg_label = torch.from_numpy(seg_label.astype(np.float32))
         seg_label.unsqueeze_(0)
-        npDep=np.array(dep_image)
-
-        point=self.create_point_cloud_from_rgb_depth(npDep,2015.0,2015.0,960.0,540.0)
-        dep_image = self.totensor(dep_image).float()
-        dep_image = self.normalize(dep_image)
-
-        point = self.totensor(point).float()
-        point = self.normalize(point)
-
         extra_dict = {}
         extra_dict['seg_label'] = seg_label
         extra_dict['seg_idx_label'] = seg_idx_label
@@ -357,7 +314,6 @@ class ApolloLaneDataset(Dataset):
 
         extra_dict['image'] = image
         extra_dict['dep_image'] = dep_image
-        extra_dict['point'] = point
 
 
         extra_dict['cam_extrinsics'] = cam_extrinsics
