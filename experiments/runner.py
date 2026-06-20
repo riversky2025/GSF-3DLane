@@ -5,11 +5,16 @@ import numpy as np
 import glob
 import time
 import os
+import datetime
+import json
+import copy
+from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
 import traceback
 import shutil
+
 from models.base import write_losses, write_val
 from data.Load_Data import *
 from data.apollo_dataset import ApolloLaneDataset
@@ -19,7 +24,7 @@ from utils import eval_3D_lane, eval_3D_once
 from utils import eval_3D_lane_apollo
 from utils.utils import *
 from models import utils
-# ddp related
+
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from .ddp import *
@@ -34,15 +39,13 @@ class Runner:
         set_work_dir(self.args)
         self.logger = create_logger(args)
 
-        # Check GPU availability
         if is_main_process():
             if not gpu_available():
                 raise Exception("No gpu available for usage")
             if int(os.getenv('WORLD_SIZE', 1)) >= 1:
-                self.logger.info("Let's use %s" % os.environ['WORLD_SIZE'] + "GPUs!")
+                self.logger.info("Let's use %s" % os.environ['WORLD_SIZE'] + " GPUs!")
                 torch.cuda.empty_cache()
         
-        # Get Dataset
         if is_main_process():
             self.logger.info("Loading Dataset ...")
 
@@ -50,7 +53,8 @@ class Runner:
         if not args.evaluate:
             self.train_dataset, self.train_loader, self.train_sampler = self._get_train_dataset()
         else:
-            self.train_dataset, self.train_loader, self.train_sampler = [],[],[]
+            self.train_dataset, self.train_loader, self.train_sampler = [], [], []
+            
         self.valid_dataset, self.valid_loader, self.valid_sampler = self._get_valid_dataset()
 
         if 'openlane' in args.dataset_name:
@@ -60,8 +64,8 @@ class Runner:
         elif 'once' in args.dataset_name:
             self.evaluator = eval_3D_once.LaneEval()
         else:
-            assert False
-        # Tensorboard writer
+            assert False, "Unsupported dataset!"
+            
         if not args.no_tb and is_main_process():
             tensorboard_path = os.path.join(args.save_path, 'Tensorboard/')
             mkdir_if_missing(tensorboard_path)
@@ -80,57 +84,57 @@ class Runner:
         timestamp = now.strftime("%Y-%m")
         trainCSVFilename = '%s/zztrain_%s.csv' % (args.save_path, timestamp)
         valCSVFilename = '%s/zzval_%s.csv' % (args.save_path, timestamp)
-        # Get Dataset
+        
         train_loader = self.train_loader
-        train_sampler= self.train_sampler
-        global lowest_loss, best_f1_epoch, best_val_f1, best_epoch
-        # Define model or resume
+        train_sampler = self.train_sampler
+        
         torch.cuda.empty_cache()
-        model, optimizer, scheduler, best_epoch, \
-            lowest_loss, best_f1_epoch, best_val_f1 = self._get_model_ddp()
+        
+        model, optimizer, scheduler, self.best_epoch, \
+            self.lowest_loss, self.best_f1_epoch, self.best_val_f1 = self._get_model_ddp()
         
         self._log_model_info(model)
         
-        def save_cur_ckpt(
-                loss,
-                with_eval=True,
-                eval_stats=None):
-            # Save model
+        def save_cur_ckpt(loss, training_meter, with_eval=True, eval_stats=None):
+            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+            
             if not with_eval:
                 self.save_checkpoint({
-                    'state_dict': model.module.state_dict(),
+                    'state_dict': state_dict,
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict()
                 }, False, epoch+1, self.args.save_path)
             else:
-                total_score = loss.item() # loss_list[0].avg
+                total_score = training_meter['all'].avg 
+                
                 if is_main_process():
-                    # File to keep latest epoch
                     with open(os.path.join(args.save_path, 'first_run.txt'), 'w') as f:
                         f.write(str(epoch + 1))
-                global best_val_f1, best_f1_epoch, lowest_loss, best_epoch
 
-                to_copy, to_save = False, True # False if args.save_best else True
+                to_copy, to_save = False, True 
 
-                if total_score < lowest_loss:
-                    best_epoch = epoch + 1
-                    lowest_loss = total_score
-                if eval_stats[0] > best_val_f1:
+                if total_score < self.lowest_loss:
+                    self.best_epoch = epoch + 1
+                    self.lowest_loss = total_score
+                    
+                if eval_stats[0] > self.best_val_f1:
                     to_copy = True
-                    best_f1_epoch = epoch + 1
-                    best_val_f1 = eval_stats[0]
+                    self.best_f1_epoch = epoch + 1
+                    self.best_val_f1 = eval_stats[0]
                     to_save = True
+                    
                 self.log_eval_stats(eval_stats)
-                self.logger.info("===> Last best F1 was {:.8f} in epoch {}".format(best_val_f1, best_f1_epoch))
+                self.logger.info("===> Last best F1 was {:.8f} in epoch {}".format(self.best_val_f1, self.best_f1_epoch))
+                
                 if not to_save:
                     return
+                    
                 self.save_checkpoint({
-                        'state_dict': model.module.state_dict(),
+                        'state_dict': state_dict,
                         'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict()
                     }, to_copy, epoch+1, self.args.save_path)
 
-        # Start training and validation for nepochs
         for epoch in range(args.start_epoch, args.nepochs):
             training_meter = defaultdict(AverageMeter)
             if is_main_process():
@@ -140,37 +144,36 @@ class Runner:
             if args.distributed:
                 train_sampler.set_epoch(epoch)
 
-            # Define container objects to keep track of multiple losses/metrics
             batch_time = AverageMeter()
-            data_time = AverageMeter()         # compute FPS
+            data_time = AverageMeter() 
             epoch_time = AverageMeter()
             
             loss = 0
 
-            # Specify operation modules
             model.train()
-            # compute timing
             end = time.time()
             epoch_time.start = end
-            # Start training loop
+            
             train_pbar = tqdm(total=len(train_loader), ncols=60)
             
             for i, extra_dict in enumerate(train_loader):
                 train_pbar.update(1)
                 data_time.update(time.time() - end)
+                
                 if gpu_available():
                     json_files = extra_dict.pop('idx_json_file')
                     for k, v in extra_dict.items():
-                        extra_dict[k] = v.cuda()
+                        if isinstance(v, torch.Tensor):
+                            extra_dict[k] = v.cuda()
                     image = extra_dict['image']
+                
                 image = image.contiguous().float()
-                # Run model
+                
                 optimizer.zero_grad()
-
                 output = model(image=image, extra_dict=extra_dict, is_training=True)
                 
-                loss, loss_info , lossjson= self._log_training_loss(
-                    output, epoch, step=i, data_loader=train_loader)
+                loss, loss_info, lossjson = self._log_training_loss(output, epoch, step=i, data_loader=train_loader)
+                
                 for name, meter in lossjson.items():
                     training_meter[name].update(meter)
 
@@ -179,26 +182,23 @@ class Runner:
                 if is_main_process():
                     self.writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
                 
-                # Setup backward pass
                 loss.backward()
 
-                # Clip gradients (usefull for instabilities or mistakes in ground truth)
                 if args.clip_grad_norm != 0:
                     nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
 
-                # update params
                 optimizer.step()
 
                 if args.lr_policy == 'cosine_warmup':
                     scheduler.step(epoch + i / len(train_loader))
                 elif args.lr_policy == 'PolyLR':
                     scheduler.step()
+                elif args.lr_policy == 'CosineAnnealing':
+                    scheduler.step()
 
-                # Time trainig iteration
                 batch_time.update(time.time() - end)
                 end = time.time()
 
-                # Print info
                 if (i + 1) % args.print_freq == 0 and is_main_process():
                     self.logger.info('Epoch: [{0}][{1}/{2}]\t'
                         'Batch Time / Avg Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
@@ -206,6 +206,7 @@ class Runner:
                             epoch+1, i+1, len(train_loader), 
                             batch_time=batch_time, data_time=data_time,
                             loss=loss.item(), loss_info=loss_info))
+                            
             train_pbar.close()
             write_losses(trainCSVFilename, training_meter, epoch)
             epoch_time.update(time.time() - epoch_time.start)
@@ -213,23 +214,23 @@ class Runner:
             if is_main_process():
                 self.logger.info('Epoch time : {:.3f} hours.'.format(epoch_time.val / 60 / 60))
             
-            # Adjust learning rate
-            if args.lr_policy != 'cosine_warmup':
+            if args.lr_policy not in ['cosine_warmup', 'PolyLR', 'CosineAnnealing']:
                 scheduler.step()
             
-            meet_eval_freq = args.eval_freq > 0 and (epoch + 1) % args.eval_freq == 0
+            dynamic_eval_freq = args.eval_freq if epoch < int(args.nepochs * 0.6) else 1
+            meet_eval_freq = dynamic_eval_freq > 0 and (epoch + 1) % dynamic_eval_freq == 0
             last_ep = (epoch == args.nepochs - 1)
 
             if meet_eval_freq or last_ep:
                 loss_valid_list, eval_stats = self.validate(model)
-                if eval_stats[0] >= best_val_f1:
-                    self.logger.info(' >>> to save new best model at ep : %s with F1 %s lr is %s' % ((epoch+1), eval_stats[0],optimizer.param_groups[0]['lr']))
-                    save_cur_ckpt(loss, with_eval=True, eval_stats=eval_stats)
+                if eval_stats[0] >= self.best_val_f1:
+                    self.logger.info(' >>> to save new best model at ep : %s with F1 %s lr is %s' % ((epoch+1), eval_stats[0], optimizer.param_groups[0]['lr']))
+                    save_cur_ckpt(loss, training_meter, with_eval=True, eval_stats=eval_stats)
                 elif last_ep:
                     self.logger.info(' >>> to save the last model at ep : %s with F1 %s' % ((epoch+1), eval_stats[0]))
-                    save_cur_ckpt(loss, with_eval=True, eval_stats=eval_stats)
+                    save_cur_ckpt(loss, training_meter, with_eval=True, eval_stats=eval_stats)
                 else:
-                    self.logger.info(' >>> skip model at ep : %s with lower F1 : %s ' % ((epoch+1), best_val_f1))
+                    self.logger.info(' >>> skip model at ep : %s with lower F1 : %s ' % ((epoch+1), self.best_val_f1))
             
                 lossjson2 = self.log_eval_stats(eval_stats)
                 if is_main_process():
@@ -238,7 +239,6 @@ class Runner:
             dist.barrier()
             torch.cuda.empty_cache()
 
-        # at the end of training
         if not args.no_tb and is_main_process():
             self.writer.close()
 
@@ -265,7 +265,7 @@ class Runner:
                 if is_main_process():
                     self.writer.add_scalar(k, v, epoch*len(data_loader) + step)
         loss_json['all'] = loss.item()
-        return loss, loss_info,loss_json
+        return loss, loss_info, loss_json
 
     def save_checkpoint(self, state, to_copy, epoch, save_path):
         if is_main_process():
@@ -275,7 +275,7 @@ class Runner:
                 file_pre = f'model_best_epoch_{epoch}.pth.tar'
                 self.logger.info('save the best model : %s' % epoch)
             else:
-                file_pre = f'checkpoint_model_epoch_{epoch}.path.tar'
+                file_pre = f'checkpoint_model_epoch_{epoch}.pth.tar'
 
             filepath = os.path.join(save_path, file_pre)
             torch.save(state, filepath)
@@ -289,7 +289,6 @@ class Runner:
 
         model.eval()
 
-        # Start validation loop
         with torch.no_grad():
             val_pbar = tqdm(total=len(loader), ncols=50)
             
@@ -299,12 +298,13 @@ class Runner:
                 if not args.no_cuda:
                     json_files = extra_dict.pop('idx_json_file')
                     for k, v in extra_dict.items():
-                        extra_dict[k] = v.cuda()
+                        if isinstance(v, torch.Tensor):
+                            extra_dict[k] = v.cuda()
                     image = extra_dict['image']
                 image = image.contiguous().float()
                 
                 output = model(image=image, extra_dict=extra_dict, is_training=False)
-                all_line_preds = output['all_line_preds'] # in ground coordinate system
+                all_line_preds = output['all_line_preds'] 
                 all_cls_scores = output['all_cls_scores']
 
                 all_line_preds = all_line_preds[-1]
@@ -316,11 +316,9 @@ class Runner:
                 else:
                     cam_extrinsics_all, cam_intrinsics_all = None, None
 
-                # Print info
                 if (i + 1) % args.print_freq == 0 and is_main_process():
                     self.logger.info('Test: [{0}/{1}]'.format(i+1, len(loader)))
 
-                # Write results
                 for j in range(num_el):
                     json_file = json_files[j]
                     if cam_extrinsics_all is not None:
@@ -350,7 +348,6 @@ class Runner:
 
                     gt_lines_sub.append(copy.deepcopy(json_line))
 
-                    # pred in ground
                     lane_pred = all_line_preds[j].cpu().numpy()
                     cls_pred = torch.argmax(all_cls_scores[j], dim=-1).cpu().numpy()
                     pos_lanes = lane_pred[cls_pred > 0]
@@ -416,7 +413,6 @@ class Runner:
                 
             if any(name in args.dataset_name for name in ['openlane', 'apollo']):
                 gather_output = [None for _ in range(args.world_size)]
-                # all_gather all eval_stats and calculate mean
                 dist.all_gather_object(gather_output, eval_stats)
                 dist.barrier()
                 eval_stats = self._recal_gpus_val(gather_output, eval_stats)
@@ -446,7 +442,6 @@ class Runner:
         }
 
         if 'apollo' in self.args.dataset_name:
-            # apollo no category accuracy.
             start_idx = 7
             gather_metrics = apollo_metrics
         else:
@@ -465,6 +460,7 @@ class Runner:
             Precision = gather_metrics['p_lane'] / gather_metrics['cnt_pred']
         else:
             Precision = gather_metrics['p_lane'] / (gather_metrics['cnt_pred'] + 1e-6)
+            
         if (Recall + Precision)!=0:
             f1_score = 2 * Recall * Precision / (Recall + Precision)
         else:
@@ -484,6 +480,7 @@ class Runner:
         else:
             eval_stats[3] = category_accuracy
             err_start_idx = 4
+            
         for i in range(4):
             err_idx = err_start_idx + i
             eval_stats[err_idx] = np.sum([eval_stats_sub[err_idx] for eval_stats_sub in gather_output]) / args.world_size
@@ -530,7 +527,6 @@ class Runner:
         self._load_ckpt_from_workdir(model)
 
         dist.barrier()
-        # DDP setting
         if args.distributed:
             model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
         _, eval_stats = self.validate(model)
@@ -555,30 +551,22 @@ class Runner:
 
     def _get_model_ddp(self):
         args = self.args
-        # define network
         model = DCG(args)
         
-        # if args.sync_bn:
         if is_main_process():
             self.logger.info("Convert model with Sync BatchNorm")
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         
         if gpu_available():
-            # Load model on gpu before passing params to optimizer
             device = torch.device("cuda", args.local_rank)
             model = model.to(device)
 
-        """
-            first load param to model, then model = DDP(model)
-        """
-
-        # resume model
         args.resume = first_run(args.save_path)
 
         model, best_epoch, lowest_loss, best_f1_epoch, best_val_f1, \
             optim_saved_state, schedule_saved_state = self.resume_model(model)
         dist.barrier()
-        # DDP setting
+        
         if args.distributed:
             model = DDP(
                 model, device_ids=[args.local_rank],
@@ -586,7 +574,6 @@ class Runner:
                 find_unused_parameters=True
             )
 
-        # Define optimizer and scheduler
         optimizer = build_optimizer(
             model,
             args.optimizer_cfg)
@@ -606,9 +593,7 @@ class Runner:
         schedule_saved_state = None
             
         if len(path) == 0 and args.resume:
-            # try the latest ckpt
             path = os.path.join(args.save_path, 'checkpoint_model_epoch_{}.pth.tar'.format(int(args.resume)))
-            # try the best ckpt saved
             if not os.path.isfile(path):
                 path = os.path.join(args.save_path, f'model_best_epoch_{args.resume}.pth.tar')
             
@@ -635,7 +620,6 @@ class Runner:
             if not args.evaluate_case:
                 valid_dataset = LaneDataset(args.dataset_dir, args.data_dir + 'validation/', args)
             else:
-                # TODO eval case
                 valid_dataset = LaneDataset(args.dataset_dir, args.data_dir + 'test/up_down_case/', args)
 
         elif 'once' in args.dataset_name:
@@ -647,14 +631,13 @@ class Runner:
         return valid_dataset, valid_loader, valid_sampler
 
     def save_eval_result_once(self, args, img_path, lanelines_pred, lanelines_prob):
-        # 3d eval result
         result = {}
         result_dir = os.path.join(args.save_path, 'once_pred/')
         mkdir_if_missing(result_dir)
         result_dir = os.path.join(result_dir, 'test/')
         mkdir_if_missing(result_dir)
         file_path_splited = img_path.split('/')
-        result_dir = os.path.join(result_dir, file_path_splited[-3]) # sequence
+        result_dir = os.path.join(result_dir, file_path_splited[-3]) 
         mkdir_if_missing(result_dir)
         result_dir = os.path.join(result_dir, 'cam01/')
         mkdir_if_missing(result_dir)
@@ -677,7 +660,6 @@ class Runner:
                                         R_vg), R_gc)
         cam_extrinsics[0:2, 3] = 0.0
 
-        # write lane result
         lane_lines = []
         for k in range(len(lanelines_pred)):
             lane = np.array(lanelines_pred[k])
@@ -714,6 +696,7 @@ class Runner:
                 'x_error_far': eval_stats[5],
                 'z_error_close': eval_stats[6],
                 'z_error_far': eval_stats[7]}
+                
     def _log_genlane_eval_info(self, eval_stats):
         if is_main_process():
             self.logger.info("===> Evaluation on validation set: \n"
@@ -733,11 +716,9 @@ class Runner:
 
 
 def set_work_dir(cfg):
-    # =========output path========== #
     save_prefix = osp.join(os.getcwd(), 'work_dirs')
     save_root = osp.join(save_prefix, cfg.output_dir)
 
-    # cur work dirname
     cfg_path = Path(cfg.config)
 
     if cfg.mod is None:
@@ -752,6 +733,4 @@ def set_work_dir(cfg):
     seg_output_dir = Path(cfg.save_path, 'seg_vis')
     seg_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # cp config into cur_work_dir
     shutil.copy(cfg_path.as_posix(), cfg.save_path)
-    
