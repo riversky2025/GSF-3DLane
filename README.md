@@ -40,8 +40,23 @@ pip install kornia==0.5.0
 
 ## Data
 
+We utilize [Depth Anything](https://github.com/LiheYoung/Depth-Anything) to generate initial relative depth maps. To reconstruct accurate 3D spatial geometry, we perform a vital pre-processing step to transform these raw relative depth predictions (d_rel) into absolute metric depth (Z_abs).
 
-We use [depth anything](https://github.com/LiheYoung/Depth-Anything) to obtain depth images.
+### Absolute Depth Conversion Model
+Monocular depth estimation typically predicts relative depth with an unknown scale and shift within the inverse depth space. We mathematically formulate this linear relationship to compute the absolute depth at the pixel level:
+
+Z_abs = s / (d_rel + O)
+
+Here, `s` represents the scaling factor and `O` denotes the depth offset. To ensure highly precise metric depth recovery, we calibrate these dataset-specific parameters using a robust Huber Regressor, which effectively mitigates point cloud noise and outliers.
+
+### Domain-Specific Calibration
+* **Apollo Dataset:** `s = 2287.0738`, `O = 7.0440`. The calculated absolute metric depth maps are scaled by 1,000 and stored offline as high-precision 16-bit PNGs (in millimeters) to preserve exact precision and prevent 8-bit quantization loss. During the online network training phase, these maps are dynamically loaded via `cv2.IMREAD_ANYDEPTH`, cast to floating-point tensors, and restored to the metric scale (meters).
+* **OpenLane Dataset:** `s = 1612.1057`, `O = 1.7317`. Calibration is achieved by engineering a dedicated offline projection pipeline that maps sparse 3D LiDAR point clouds to the 2D image plane, safely filtering out invalid points to establish highly reliable matched depth pairs.
+
+### High-Performance Generation Pipeline
+Due to the massive scale of the datasets, the relative-to-absolute depth conversion module is optimized using TensorRT. The complete, highly accelerated C++ implementation is available online as an open-source repository. You can access the code and reproduce the dataset preparation process here:
+
+🔗 [**depth_gen Repository**](https://github.com/riversky2025/depth_gen.git)
 
 ## Pretrained Models
 
@@ -67,7 +82,7 @@ CUDA_VISIBLE_DEVICES='0,1,2,3' python -m torch.distributed.launch --nproc_per_no
 
 ### Openlane
 ```
-CUDA_VISIBLE_DEVICES='0,1,2,3' python -m torch.distributed.launch --nproc_per_node 4 main.py --config config/gsf/openlane_1000_baseline.py
+CUDA_VISIBLE_DEVICES='0,1,2' python -m torch.distributed.launch --nproc_per_node 3 main.py --config config/gsf/openlane_1000_baseline.py
 ```
 
 ## Evaluation
