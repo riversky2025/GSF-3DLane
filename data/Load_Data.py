@@ -122,9 +122,9 @@ class LaneDataset(Dataset):
         else:
             self.n_samples = self._label_image_path.shape[0]
             
-        K = np.array([[1000., 0., 960.],
-                      [0., 1000., 640.],
-                      [0., 0., 1.]])
+        K = np.array([[2081.5212033927246, 0.0, 934.7111248349433],
+                                                    [0.0, 2081.5212033927246, 646.3389987785433],
+                                                    [0., 0., 1.]])
 
       
         cam_height = 1.55
@@ -347,142 +347,7 @@ class LaneDataset(Dataset):
 
         return proj_g2c, camera_K
 
-    def create_point_cloud_from_rgb_depth(self, imgDep, cx, cy, fx, fy, depth_scale=1.0):
-        """
-        Creates a point cloud from RGB and depth images.
 
-        Args:
-            rgb_path (str): The file path of the RGB image.
-            depth_path (str): The file path of the depth image.
-            cx (float): The X-coordinate center of the camera.
-            cy (float): The Y-coordinate center of the camera.
-            fx (float): The X-axis focal length of the camera.
-            fy (float): The Y-axis focal length of the camera.
-            depth_scale (float, optional): The scaling factor for the depth. Defaults to 1.0.
-
-        Returns:
-            point_cloud (open3d.geometry.PointCloud): The resulting point cloud.
-        """
-        # Load the images
-
-        # Check that the input images are NumPy arrays
-        if not isinstance(imgDep, np.ndarray):
-            raise TypeError("Input images must be NumPy arrays.")
-
-        # Check that the input images are 3-channel RGB and single-channel depth
-
-        if imgDep.ndim == 3 and imgDep.shape[2] == 3:
-            # imgDep = np.dot(imgDep[..., :3], [0.299, 0.587, 0.114])
-            imgDep = imgDep[..., 0]
-
-        # Calculate the XYZ values for each point
-        rows, cols = imgDep.shape
-        u, v = np.meshgrid(np.arange(cols), np.arange(rows))
-        d = imgDep.astype(np.float32) / depth_scale
-        x = (u - cx) * d / fx
-        y = (v - cy) * d / fy
-        z = d
-
-        # Combine XYZ values into a single array
-        points = np.stack([x, y, z], axis=-1)
-
-        return points
-    def filter_points_by_y_slice_quantile(self,points, num_slices, quantile=0.25):
-        """
-        根据 Y 方向的空间切片（等比数列）对点云进行分段，计算每个切片的第 1 四分位数，并将未通过该四分位数过滤的点设置为0.0。
-
-        参数:
-        points (np.ndarray): 点云数据，大小为 (num_points, 3)，其中第二列是Y值，第三列是高度（Z值）
-        num_slices (int): 切片的数量
-        quantile (float): 要计算的四分位数，默认为 0.25
-
-        返回:
-        np.ndarray: 处理后的点云数据
-        """
-        # 复制原始点云数据
-        processed_points = points.copy()
-
-        y_values = points[:, 1]
-
-        # 如果 Y 值有负数或零，进行平移
-        y_min = np.min(y_values)
-        if y_min <= 0:
-            offset = 1 - y_min  # 平移量，使最小值变为1
-            y_values += offset
-        else:
-            offset = 0
-
-        y_min, y_max = np.min(y_values), np.max(y_values)
-
-        # 计算对数范围
-        log_y_min, log_y_max = np.log10(y_min), np.log10(y_max)
-
-        # 在对数空间中计算切片的边界
-        log_y_slices = np.linspace(log_y_min, log_y_max, num_slices + 1)
-
-        # 将对数空间的切片边界映射回原始空间
-        y_slices = 10 ** log_y_slices
-
-        if offset > 0:
-            y_slices -= offset  # 平移回原始空间
-
-        # 初始化一个布尔数组用于标记所有点是否有效
-        valid_mask = np.zeros(points.shape[0], dtype=bool)
-
-        for i in range(num_slices):
-            # 当前切片的 Y 轴范围
-            y_low, y_high = y_slices[i], y_slices[i + 1]
-
-            # 筛选当前切片中的点
-            slice_mask = (points[:, 1] >= y_low) & (points[:, 1] < y_high)
-            slice_points = points[slice_mask]
-
-            if len(slice_points) == 0:
-                continue
-
-            # 计算当前切片的第 1 四分位数
-            heights = slice_points[:, 2]
-            q1_height = np.percentile(heights, quantile * 100)
-
-            # 更新有效点的掩码
-            valid_slice_mask = slice_mask & (points[:, 2] <= q1_height)
-            valid_mask |= valid_slice_mask
-
-        # 将无效点设置为0.0
-        processed_points[~valid_mask] = 0.0
-
-        return processed_points
-    def project_depth_to_points(self, depth):
-        rows, cols = depth.shape
-        c, r = np.meshgrid(np.arange(cols), np.arange(rows))
-        points = np.stack([c, r, depth])
-        points = points.reshape((3, -1))
-        points = points.T
-        cloud = self.calib.project_image_to_velo(points)
-        cloud = cloud[:, [0, 2, 1]]
-        cloud[:, 2] = -cloud[:, 2]
-   # radio = 5
-        cloud = self.filter_points_by_y_slice_quantile(cloud, 200, 0.25)
-
-
-        coeffs = self.calib.fit_quadratic_surface(cloud)
-        # 过滤属于曲面的点
-        cloud = self.calib.filter_surface_points(cloud, coeffs, threshold=0.9)
-
-
-        # surface_points = self.calib.generate_points_on_surface(coeffs)
-
-        # 合并原始点云和生成的新点
-        # filtered_point_cloud = self.calib.update_point_cloud_with_surface(filtered_point_cloud, surface_points, threshold=0.1)
-
-        # valid = (
-        #     (roi_cloud[:, 0] >= -30) & (roi_cloud[:, 0] <= 30) &  # x 轴范围
-        #     (roi_cloud[:, 1] >= 0) & (roi_cloud[:, 1] <= 130) &  # y 轴范围
-        #         (roi_cloud[:, 2] >= -15) & (roi_cloud[:, 2] <= 15)  # z 轴范围
-        #     # (cloud[:, 2] < max_high)  # 保持原有的 z 轴过滤条件
-        # )
-        # roi_cloud[~valid]=0.00
-        return cloud
     # new getitem, WIP
     def WIP__getitem__(self, idx):
         """
@@ -524,18 +389,27 @@ class LaneDataset(Dataset):
             extrinsics[2, 3] = gt_cam_height
 
         img_name = _label_image_path
-        dep_name = img_name.replace('validation', 'depth').replace('training', 'depth').replace('jpg', 'png')
+        dep_name = img_name.replace('validation', 'depth_absolute').replace('training', 'depth_absolute').replace('jpg', 'png')
         with open(img_name, 'rb') as f:
             image = (Image.open(f).convert('RGB'))
-        dep_image = cv2.imread(dep_name)
-        if dep_image is None:
-            print(img_name)
+        
         # image preprocess with crop and resize
         image = F.crop(image, self.h_crop, 0, self.h_org - self.h_crop, self.w_org)
         image = F.resize(image, size=(self.h_net, self.w_net), interpolation=InterpolationMode.BILINEAR)
-
-        dep_image = cv2.resize(dep_image, (self.w_net, self.h_net), interpolation=cv2.INTER_LINEAR)
+        dep_image = cv2.imread(dep_name, cv2.IMREAD_ANYDEPTH)
+        if dep_image is None:
+            print(f"Error loading depth: {dep_name}")
+            
         
+        dep_image = cv2.resize(dep_image, (self.w_net, self.h_net), interpolation=cv2.INTER_NEAREST)
+
+       
+        dep_image = dep_image.astype(np.float32)
+        
+       
+        dep_image = torch.from_numpy(dep_image)  
+        dep_image = dep_image.unsqueeze(0)       
+        dep_image = dep_image / 1000.0          
         gt_category_2d = _gt_laneline_category_org
         if self.data_aug:
             img_rot, aug_mat = data_aug_rotate(image)
@@ -626,10 +500,6 @@ class LaneDataset(Dataset):
         seg_label.unsqueeze_(0)
         
         
-        dep_image = self.totensor(dep_image).float()
-        dep_image = self.normalize(dep_image)
-
-        
 
         extra_dict['seg_label'] = seg_label
         extra_dict['seg_idx_label'] = seg_idx_label
@@ -642,7 +512,6 @@ class LaneDataset(Dataset):
         extra_dict['extrinsics'] = extrinsics
         extra_dict['image'] = image
         extra_dict['dep_image'] = dep_image
-        #extra_dict['point'] = point
         if self.data_aug:
             aug_mat = torch.from_numpy(aug_mat.astype(np.float32))
             extra_dict['aug_mat'] = aug_mat
