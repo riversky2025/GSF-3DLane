@@ -7,7 +7,7 @@ _base_ = [
     '../_base_/optimizer.py',
 ]
 
-mod = 'release_iccv/apollo_standard'
+mod = 'release_tip/apollo_standard'
 mean = [0.485, 0.456, 0.406]
 std = [0.229, 0.224, 0.225]
 
@@ -22,8 +22,6 @@ max_lanes = 6
 T_max = 30
 eta_min = 1e-6
 clip_grad_norm = 20
-nepochs = 500
-eval_freq = 1
 
 h_org, w_org = 1080, 1920
 
@@ -43,7 +41,7 @@ position_range = [
 anchor_y_steps = np.linspace(3, 103, 20)
 num_y_steps = len(anchor_y_steps)
 
-_dim_ = 256
+_dim_ = 184
 num_query = 40
 num_pt_per_line = 20
 # 'latr,petr,dc'
@@ -53,51 +51,25 @@ dcg_cfg = dict(
     num_query=num_query,
     num_group=1,
     sparse_num_group=4,
-    encoder=dict(
+     encoder=dict(
         type='ResNet',
         depth=34,
         num_stages=4,
-        out_indices=(1, 2, 3),
+        out_indices=(3,),  
         frozen_stages=-1,
-        norm_cfg=dict(type='BN2d', requires_grad=False),
-        norm_eval=True,
-        style='caffe',
-        init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet34'),
-        dcn=dict(type='DCNv2', deform_groups=1, fallback_on_stride=False),
-        stage_with_dcn=(False, False, False, False),
-    ),
-    neck=dict(
-        type='FPN',
-        in_channels=[128, 256, 512],
-        # in_channels=[512, 768, 1024],
-        # in_channels=[512, 1024, 2048],
-        out_channels=_dim_,
-        start_level=0,
-        add_extra_convs='on_output',
-        num_outs=4,
-        relu_before_extra_convs=True
+        norm_cfg=dict(type='BN2d', requires_grad=True),
+        norm_eval=False,
+        style='pytorch',
+        init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet34')
     ),
     pts_backbone=dict(
         type='SECOND',
-        in_channels=3,
+        in_channels=32,
         out_channels=[128, 256, 512],
-        layer_nums=[5, 5, 5],
+        layer_nums=[4, 2, 1],
         layer_strides=[8, 2, 1],
         norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
         conv_cfg=dict(type='Conv2d', bias=False)),
-    pts_neck=dict(
-        type='SECONDFPN',
-        in_channels=[128, 256, 512],
-        out_channels=[_dim_, _dim_, _dim_],
-        upsample_strides=[1, 2, 2],
-        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
-        upsample_cfg=dict(type='deconv', bias=False),
-        use_conv_for_no_stride=True),
-
-    ms2one=dict(
-        type='DilateNaive',
-        inc=_dim_, outc=_dim_, num_scales=3,
-        dilations=(1, 2, 5)),
     head=dict(
         xs_loss_weight=2.0,
         zs_loss_weight=10.0,
@@ -228,7 +200,7 @@ resize_w = 960
 #resize_h = 352
 #resize_w = 448
 
-nepochs = 3000
+nepochs = 350
 eval_freq = 1
 optimizer_cfg = dict(
     type='AdamW',
