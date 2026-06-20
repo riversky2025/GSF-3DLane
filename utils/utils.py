@@ -409,16 +409,20 @@ def define_scheduler(optimizer, args, dataset_size=None):
             return lr_l
 
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_rule)
+        
     elif args.lr_policy == 'step':
         scheduler = lr_scheduler.StepLR(optimizer,
                                         step_size=args.lr_decay_iters, gamma=args.gamma)
+                                        
     elif args.lr_policy == 'multi_step':
         scheduler = lr_scheduler.MultiStepLR(
             optimizer, step_size=args.lr_multi_steps, gamma=args.gamma)
+            
     elif args.lr_policy == 'cosine':
         scheduler = lr_scheduler.CosineAnnealingLR(optimizer,
                                                    T_max=args.T_max, eta_min=args.eta_min)
-    elif args.lr_policy=='ReduceLROnPlateau':
+                                                   
+    elif args.lr_policy == 'ReduceLROnPlateau':
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode=args.lr_config['mode'],
@@ -427,6 +431,7 @@ def define_scheduler(optimizer, args, dataset_size=None):
             threshold=args.lr_config['threshold'],
             min_lr=args.lr_config['min_lr']
         )
+        
     elif args.lr_policy == 'cosine_warm':
         '''
         lr_config = dict(
@@ -444,16 +449,43 @@ def define_scheduler(optimizer, args, dataset_size=None):
     #                                                factor=args.gamma,
     #                                                threshold=0.0001,
     #                                                patience=args.lr_decay_iters)
+    
     elif args.lr_policy == 'cosine_warmup':
         from functools import partial
         cosine_warmup = partial(cosine_schedule_with_warmup, args=args, dataset_size=dataset_size)
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=cosine_warmup)
+    elif args.lr_policy == 'CosineAnnealing':
+        if dataset_size is None:
+            raise ValueError("dataset_size cannot be None when using 'CosineAnnealing' strategy.")
+            
+        lr_config = getattr(args, 'lr_config', {})
+        warmup_iters = lr_config.get('warmup_iters', 5000)
+        warmup_ratio = lr_config.get('warmup_ratio', 1.0 / 3)
+        min_lr = lr_config.get('min_lr', 5e-7)
+        
+        max_iters = args.nepochs * dataset_size 
+        base_lr = optimizer.param_groups[0]['lr']
+
+        def lr_lambda(current_iter):
+            if current_iter < warmup_iters:
+                alpha = current_iter / warmup_iters
+                return warmup_ratio + (1.0 - warmup_ratio) * alpha
+            else:
+                progress = (current_iter - warmup_iters) / max(1, max_iters - warmup_iters)
+                progress = min(1.0, max(0.0, progress)) 
+                cosine_lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
+                return cosine_lr / base_lr 
+                
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     elif args.lr_policy == 'None':
         scheduler = None
+        
     else:
-        return NotImplementedError('learning rate policy [%s] is not implemented', args.lr_policy)
+        raise NotImplementedError(f"learning rate policy [{args.lr_policy}] is not implemented")
+        
     return scheduler
+
 
 
 def define_init_weights(model, init_w='normal', activation='relu'):
